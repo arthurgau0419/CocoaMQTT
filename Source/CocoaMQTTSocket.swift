@@ -6,7 +6,7 @@
 //
 
 import Foundation
-import CocoaAsyncSocket
+import Network
 
 // MARK: - Interfaces
 
@@ -46,8 +46,9 @@ public class CocoaMQTTSocket: NSObject {
     /// Default is false
     public var allowUntrustCACertificate = false
     
-    fileprivate let reference = GCDAsyncSocket()
+    fileprivate var reference: NWConnection!
     fileprivate weak var delegate: CocoaMQTTSocketDelegate?
+    fileprivate var delegateQueue: DispatchQueue?
     
     public override init() { super.init() }
 }
@@ -55,7 +56,7 @@ public class CocoaMQTTSocket: NSObject {
 extension CocoaMQTTSocket: CocoaMQTTSocketProtocol {
     public func setDelegate(_ theDelegate: CocoaMQTTSocketDelegate?, delegateQueue: DispatchQueue?) {
         delegate = theDelegate
-        reference.setDelegate((delegate != nil ? self : nil), delegateQueue: delegateQueue)
+        self.delegateQueue = delegateQueue
     }
     
     public func connect(toHost host: String, onPort port: UInt16) throws {
@@ -63,73 +64,95 @@ extension CocoaMQTTSocket: CocoaMQTTSocketProtocol {
     }
     
     public func connect(toHost host: String, onPort port: UInt16, withTimeout timeout: TimeInterval) throws {
-        try reference.connect(toHost: host, onPort: port, withTimeout: timeout)
+        let reference = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tls)
+        self.reference = reference
+        reference.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                self.delegate?.socketConnected(self)
+            case .failed(let error):
+                self.delegate?.socketDidDisconnect(self, withError: error)
+            default:
+                break
+            }
+        }
+        reference.start(queue: delegateQueue ?? .main)
     }
     
     public func disconnect() {
-        reference.disconnect()
+        reference.cancel()
     }
     
     public func readData(toLength length: UInt, withTimeout timeout: TimeInterval, tag: Int) {
-        reference.readData(toLength: length, withTimeout: timeout, tag: tag)
+        reference.receive(minimumIncompleteLength: Int(length), maximumLength: Int(length)) { (data, ctx, b, errpr) in
+            guard let data = data else { return }
+            self.delegate?.socket(self, didRead: data, withTag: tag)
+        }
     }
     
     public func write(_ data: Data, withTimeout timeout: TimeInterval, tag: Int) {
-        reference.write(data, withTimeout: timeout, tag: tag)
-    }
-}
-
-extension CocoaMQTTSocket: GCDAsyncSocketDelegate {
-    public func socket(_ sock: GCDAsyncSocket, didConnectToHost host: String, port: UInt16) {
-        printInfo("Connected to \(host) : \(port)")
-        
-         #if os(iOS)
-             if backgroundOnSocket {
-                 sock.perform {
-                     guard sock.enableBackgroundingOnSocket() else {
-                         printWarning("Enable backgrounding socket failed, please check related permissions")
-                         return
-                     }
-                     printInfo("Enable backgrounding socket successfully")
-                 }
-             }
-         #endif
-        
-         if enableSSL {
-             var setting = sslSettings ?? [:]
-             if allowUntrustCACertificate {
-                 setting[GCDAsyncSocketManuallyEvaluateTrust as String] = NSNumber(value: true)
-             }
-             sock.startTLS(setting)
-         } else {
-            delegate?.socketConnected(self)
-         }
-    }
-
-    public func socket(_ sock: GCDAsyncSocket, didReceive trust: SecTrust, completionHandler: @escaping (Bool) -> Swift.Void) {
-        if let theDelegate = delegate {
-            theDelegate.socket(self, didReceive: trust, completionHandler: completionHandler)
-        } else {
-            completionHandler(false)
+        let completion = NWConnection.SendCompletion.contentProcessed { (error) in
+            if let error = error {
+                self.delegate?.socketDidDisconnect(self, withError: error)
+            } else {
+                self.delegate?.socket(self, didWriteDataWithTag: tag)
+            }
         }
-    }
-
-    public func socketDidSecure(_ sock: GCDAsyncSocket) {
-        printDebug("socket did secure")
-        delegate?.socketConnected(self)
-    }
-
-    public func socket(_ sock: GCDAsyncSocket, didWriteDataWithTag tag: Int) {
-        printDebug("socket wrote data \(tag)")
-        delegate?.socket(self, didWriteDataWithTag: tag)
-    }
-
-    public func socket(_ sock: GCDAsyncSocket, didRead data: Data, withTag tag: Int) {
-        delegate?.socket(self, didRead: data, withTag: tag)
-    }
-
-    public func socketDidDisconnect(_ sock: GCDAsyncSocket, withError err: Error?) {
-        printDebug("socket disconnected")
-        delegate?.socketDidDisconnect(self, withError: err)
+        reference.send(content: data, completion: completion)
     }
 }
+
+//extension CocoaMQTTSocket: GCDAsyncSocketDelegate {
+//    public func socket(_ sock: GCDAsyncSocket, didConnectToHost host: String, port: UInt16) {
+//        printInfo("Connected to \(host) : \(port)")
+//        
+//         #if os(iOS)
+//             if backgroundOnSocket {
+//                 sock.perform {
+//                     guard sock.enableBackgroundingOnSocket() else {
+//                         printWarning("Enable backgrounding socket failed, please check related permissions")
+//                         return
+//                     }
+//                     printInfo("Enable backgrounding socket successfully")
+//                 }
+//             }
+//         #endif
+//        
+//         if enableSSL {
+//             var setting = sslSettings ?? [:]
+//             if allowUntrustCACertificate {
+//                 setting[GCDAsyncSocketManuallyEvaluateTrust as String] = NSNumber(value: true)
+//             }
+//             sock.startTLS(setting)
+//         } else {
+//            delegate?.socketConnected(self)
+//         }
+//    }
+//
+//    public func socket(_ sock: GCDAsyncSocket, didReceive trust: SecTrust, completionHandler: @escaping (Bool) -> Swift.Void) {
+//        if let theDelegate = delegate {
+//            theDelegate.socket(self, didReceive: trust, completionHandler: completionHandler)
+//        } else {
+//            completionHandler(false)
+//        }
+//    }
+//
+//    public func socketDidSecure(_ sock: GCDAsyncSocket) {
+//        printDebug("socket did secure")
+//        delegate?.socketConnected(self)
+//    }
+//
+//    public func socket(_ sock: GCDAsyncSocket, didWriteDataWithTag tag: Int) {
+//        printDebug("socket wrote data \(tag)")
+//        delegate?.socket(self, didWriteDataWithTag: tag)
+//    }
+//
+//    public func socket(_ sock: GCDAsyncSocket, didRead data: Data, withTag tag: Int) {
+//        delegate?.socket(self, didRead: data, withTag: tag)
+//    }
+//
+//    public func socketDidDisconnect(_ sock: GCDAsyncSocket, withError err: Error?) {
+//        printDebug("socket disconnected")
+//        delegate?.socketDidDisconnect(self, withError: err)
+//    }
+//}
